@@ -12,8 +12,8 @@ mkdir -p ~/blossom-cli
 cd ~/blossom-cli
 
 # Clone the repository
-echo "Cloning Blossom CLI repository..."
-git clone https://github.com/girino/blossom-cli.git .
+# echo "Cloning Blossom CLI repository..."
+# git clone https://github.com/girino/blossom-cli.git .
 
 # Download Go dependencies
 echo "Downloading Go dependencies..."

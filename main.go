@@ -2,9 +2,7 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
@@ -108,8 +105,10 @@ func createAuthorizationEvent(privKey string, verb string, tags [][]string) (str
 		Content:   "Authorize Upload",
 	}
 
-	// Add the provided tags directly without the verb tag
-	event.Tags = append(event.Tags, tags...)
+	for _, tag := range tags {
+		nostrTag := nostr.Tag(tag)
+		event.Tags = append(event.Tags, nostrTag)
+	}
 
 	// Convert the private key from hex
 	secKey := privKey
