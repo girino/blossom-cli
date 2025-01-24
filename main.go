@@ -2,9 +2,7 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
@@ -102,18 +99,15 @@ func convertNIP19ToHex(key string) (string, error) {
 func createAuthorizationEvent(privKey string, verb string, tags [][]string) (string, error) {
 	// Create a new event
 	event := nostr.Event{
-		Kind:      24242,
+		Kind:      22242,
 		CreatedAt: nostr.Now(),
 		Tags:      nostr.Tags{},
-		Content:   "Upload file",
+		Content:   "Authorize Upload",
 	}
 
-	// Add the verb tag
-	event.Tags = append(event.Tags, nostr.Tag{"t", verb})
-
-	// Add additional tags
 	for _, tag := range tags {
-		event.Tags = append(event.Tags, tag)
+		nostrTag := nostr.Tag(tag)
+		event.Tags = append(event.Tags, nostrTag)
 	}
 
 	// Convert the private key from hex
@@ -156,41 +150,32 @@ func uploadFile(server, filePath, privKey string) error {
 	}
 	defer file.Close()
 
-	// Calculate SHA256
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return err
-	}
-	sha256Hash := hex.EncodeToString(hasher.Sum(nil))
-
-	// Reset file pointer
-	file.Seek(0, io.SeekStart)
-
 	// Get file info
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return err
 	}
 
-	// Create authorization event
+	// Create authorization event with the correct tags
 	authEventJSON, err := createAuthorizationEvent(privKey, "upload", [][]string{
-		{"x", sha256Hash},
-		{"t", "upload"},
-		{"expiration", fmt.Sprintf("%d", time.Now().Add(5*time.Minute).Unix())},
+		{"name", fileInfo.Name()},
+		{"size", fmt.Sprintf("%d", fileInfo.Size())},
 	})
 	if err != nil {
 		return err
 	}
 
-	// Create request
-	uploadURL := server + "/upload"
+	// Create request with correct endpoint
+	uploadURL := server + "/item"  // Changed from "/upload" to "/item"
 	req, err := http.NewRequest("PUT", uploadURL, file)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
-	req.Header.Set("Authorization", "Nostr "+authEventJSON)
+
+	// Add the auth parameter to the URL
+	q := req.URL.Query()
+	q.Add("auth", authEventJSON)
+	req.URL.RawQuery = q.Encode()
 
 	// Send request
 	client := &http.Client{}
