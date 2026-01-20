@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/h2non/filetype"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 )
@@ -172,6 +173,21 @@ func uploadFile(server, filePath, privKey string) error {
 		return err
 	}
 
+	// Read file content to identify MIME type
+	buf := make([]byte, 261)
+	_, err = file.Read(buf)
+	if err != nil {
+		return err
+	}
+	kind, err := filetype.Match(buf)
+	if err != nil {
+		return err
+	}
+	mimeType := kind.MIME.Value
+
+	// Reset file pointer to the beginning
+	file.Seek(0, io.SeekStart)
+
 	// Create authorization event
 	authEventJSON, err := createAuthorizationEvent(privKey, "upload", [][]string{
 		{"x", sha256Hash},
@@ -188,7 +204,7 @@ func uploadFile(server, filePath, privKey string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Type", mimeType)
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
 	req.Header.Set("Authorization", "Nostr "+authEventJSON)
 
