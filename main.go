@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -10,7 +11,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +26,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: blossom-cli <upload|download|get|list> [options]")
+		fmt.Println("Usage: blossom-cli <upload|download|get|list|mirror> [options]")
 		os.Exit(1)
 	}
 
@@ -33,14 +38,21 @@ func main() {
 		server := uploadCmd.String("server", "", "Blossom server URL")
 		filePath := uploadCmd.String("file", "", "File to upload")
 		privKey := uploadCmd.String("privkey", "", "Private key for authorization")
+		expirationStr := uploadCmd.String("expiration", "5m", "Expiration time (e.g., 60s, 5m, 2h). Defaults to 5m. If no unit given, assumes seconds.")
 		uploadCmd.Parse(os.Args[2:])
 
 		if *server == "" || *filePath == "" || *privKey == "" {
-			fmt.Println("Usage: blossom-cli upload -server <server_url> -file <file_path> -privkey <private_key>")
+			fmt.Println("Usage: blossom-cli upload -server <server_url> -file <file_path> -privkey <private_key> [-expiration <time>]")
 			os.Exit(1)
 		}
 
-		err := uploadFile(*server, *filePath, *privKey)
+		expiration, err := parseDuration(*expirationStr)
+		if err != nil {
+			fmt.Println("Error parsing expiration time:", err)
+			os.Exit(1)
+		}
+
+		err = uploadFile(*server, *filePath, *privKey, expiration)
 		if err != nil {
 			fmt.Println("Error uploading file:", err)
 			os.Exit(1)
@@ -81,9 +93,67 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "mirror":
+		mirrorCmd := flag.NewFlagSet("mirror", flag.ExitOnError)
+		server := mirrorCmd.String("server", "", "Destination Blossom server URL")
+		sourceServer := mirrorCmd.String("source-server", "", "Source Blossom server URL where the blob is located")
+		hash := mirrorCmd.String("hash", "", "SHA256 hash of the blob")
+		blobURL := mirrorCmd.String("url", "", "Full URL of the blob to mirror (extracts source-server and hash from URL)")
+		privKey := mirrorCmd.String("privkey", "", "Private key for authorization")
+		expirationStr := mirrorCmd.String("expiration", "5m", "Expiration time (e.g., 60s, 5m, 2h). Defaults to 5m. If no unit given, assumes seconds.")
+		mirrorCmd.Parse(os.Args[2:])
+
+		// Validate mutually exclusive options
+		usingURL := *blobURL != ""
+		usingServerHash := *sourceServer != "" || *hash != ""
+
+		if usingURL && usingServerHash {
+			fmt.Println("Error: Cannot use -url together with -source-server or -hash")
+			fmt.Println("Usage: blossom-cli mirror -server <destination_server_url> (-source-server <source_server_url> -hash <sha256_hash> | -url <blob_url>) -privkey <private_key> [-expiration <time>]")
+			os.Exit(1)
+		}
+
+		if *server == "" || *privKey == "" {
+			fmt.Println("Usage: blossom-cli mirror -server <destination_server_url> (-source-server <source_server_url> -hash <sha256_hash> | -url <blob_url>) -privkey <private_key> [-expiration <time>]")
+			os.Exit(1)
+		}
+
+		var finalSourceServer, finalHash string
+
+		if usingURL {
+			// Extract server and hash from URL
+			extractedServer, extractedHash, err := extractServerAndHashFromURL(*blobURL)
+			if err != nil {
+				fmt.Println("Error extracting server and hash from URL:", err)
+				os.Exit(1)
+			}
+			finalSourceServer = extractedServer
+			finalHash = extractedHash
+		} else {
+			// Use provided source-server and hash
+			if *sourceServer == "" || *hash == "" {
+				fmt.Println("Usage: blossom-cli mirror -server <destination_server_url> (-source-server <source_server_url> -hash <sha256_hash> | -url <blob_url>) -privkey <private_key> [-expiration <time>]")
+				os.Exit(1)
+			}
+			finalSourceServer = *sourceServer
+			finalHash = *hash
+		}
+
+		expiration, err := parseDuration(*expirationStr)
+		if err != nil {
+			fmt.Println("Error parsing expiration time:", err)
+			os.Exit(1)
+		}
+
+		err = mirrorBlob(*server, finalSourceServer, finalHash, *privKey, expiration)
+		if err != nil {
+			fmt.Println("Error mirroring blob:", err)
+			os.Exit(1)
+		}
+
 	default:
 		fmt.Println("Unknown command:", command)
-		fmt.Println("Usage: blossom-cli <upload|download|get|list> [options]")
+		fmt.Println("Usage: blossom-cli <upload|download|get|list|mirror> [options]")
 		os.Exit(1)
 	}
 }
@@ -97,6 +167,46 @@ func convertNIP19ToHex(key string) (string, error) {
 		return decoded.(string), nil
 	}
 	return key, nil
+}
+
+// parseDuration parses a duration string like "60s", "5m", "2h", etc.
+// If no unit is given, assumes seconds.
+func parseDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 5 * time.Minute, nil
+	}
+
+	// Match number and optional unit
+	re := regexp.MustCompile(`^(\d+)([smhd]?)$`)
+	matches := re.FindStringSubmatch(s)
+	if matches == nil {
+		return 0, fmt.Errorf("invalid duration format: %s", s)
+	}
+
+	value, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, fmt.Errorf("invalid number in duration: %s", matches[1])
+	}
+
+	unit := matches[2]
+	if unit == "" {
+		// No unit given, assume seconds
+		return time.Duration(value) * time.Second, nil
+	}
+
+	switch unit {
+	case "s":
+		return time.Duration(value) * time.Second, nil
+	case "m":
+		return time.Duration(value) * time.Minute, nil
+	case "h":
+		return time.Duration(value) * time.Hour, nil
+	case "d":
+		return time.Duration(value) * 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unknown time unit: %s", unit)
+	}
 }
 
 // Add a function to create the authorization event
@@ -150,7 +260,7 @@ func createAuthorizationEvent(privKey string, verb string, tags [][]string) (str
 	return encodedJSON, nil
 }
 
-func uploadFile(server, filePath, privKey string) error {
+func uploadFile(server, filePath, privKey string, expiration time.Duration) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -192,7 +302,7 @@ func uploadFile(server, filePath, privKey string) error {
 	authEventJSON, err := createAuthorizationEvent(privKey, "upload", [][]string{
 		{"x", sha256Hash},
 		{"t", "upload"},
-		{"expiration", fmt.Sprintf("%d", time.Now().Add(5*time.Minute).Unix())},
+		{"expiration", fmt.Sprintf("%d", time.Now().Add(expiration).Unix())},
 	})
 	if err != nil {
 		return err
@@ -346,4 +456,100 @@ func insertCommas(jsonStr string) string {
 	}
 
 	return result.String()
+}
+
+// extractServerAndHashFromURL extracts the server base URL and hash from a full blob URL
+// Example: https://cdn.satellite.earth/b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553.pdf
+// Returns: https://cdn.satellite.earth, b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553
+func extractServerAndHashFromURL(blobURL string) (string, string, error) {
+	parsedURL, err := url.Parse(blobURL)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid URL: %v", err)
+	}
+
+	// Get the base server URL (scheme + host, which already includes port if present)
+	serverURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+
+	// Get the path and extract hash from it
+	path := parsedURL.Path
+	base := filepath.Base(path)
+
+	// Remove file extension if present
+	baseWithoutExt := strings.TrimSuffix(base, filepath.Ext(base))
+
+	// Check if the base (without extension) is a 64-character hex string
+	hashRegex := regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+	if hashRegex.MatchString(baseWithoutExt) {
+		return serverURL, strings.ToLower(baseWithoutExt), nil
+	}
+
+	// Also check if there's a hash in the path segments
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+	for _, part := range pathParts {
+		partWithoutExt := strings.TrimSuffix(part, filepath.Ext(part))
+		if hashRegex.MatchString(partWithoutExt) {
+			return serverURL, strings.ToLower(partWithoutExt), nil
+		}
+	}
+
+	return "", "", fmt.Errorf("could not find SHA256 hash in URL path: %s", blobURL)
+}
+
+func mirrorBlob(server, sourceServer, hash, privKey string, expiration time.Duration) error {
+	// Construct the blob URL from source server and hash
+	blobURL := strings.TrimSuffix(sourceServer, "/") + "/" + hash
+
+	// Create authorization event with the hash
+	authEventJSON, err := createAuthorizationEvent(privKey, "upload", [][]string{
+		{"x", hash},
+		{"t", "upload"},
+		{"expiration", fmt.Sprintf("%d", time.Now().Add(expiration).Unix())},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Create JSON body with the URL
+	requestBody := map[string]string{
+		"url": blobURL,
+	}
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return err
+	}
+
+	// Create request
+	mirrorURL := strings.TrimSuffix(server, "/") + "/mirror"
+	req, err := http.NewRequest("PUT", mirrorURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Nostr "+authEventJSON)
+
+	// Send request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Check response
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mirror failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// Parse response
+	var descriptor map[string]interface{}
+	err = json.NewDecoder(resp.Body).Decode(&descriptor)
+	if err != nil {
+		return err
+	}
+
+	// Print blob descriptor
+	blobJSON, _ := json.MarshalIndent(descriptor, "", "  ")
+	fmt.Println(string(blobJSON))
+	return nil
 }
