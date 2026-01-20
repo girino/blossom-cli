@@ -1,4 +1,4 @@
-module blossom-cli
+module github.com/girino/blossom-cli
 
 go 1.23.1
 
