@@ -104,16 +104,17 @@ func main() {
 		listCmd := flag.NewFlagSet("list", flag.ExitOnError)
 		server := listCmd.String("server", "", "Blossom server URL")
 		pubkey := listCmd.String("pubkey", "", "Public key hex")
+		privKey := listCmd.String("privkey", "", "Private key for authorization (optional)")
 		verboseFlag := listCmd.Bool("v", false, "Enable verbose/debug output")
 		listCmd.Parse(os.Args[2:])
 		verbose = *verboseFlag
 
 		if *server == "" || *pubkey == "" {
-			fmt.Println("Usage: blossom-cli list -server <server_url> -pubkey <pubkey>")
+			fmt.Println("Usage: blossom-cli list -server <server_url> -pubkey <pubkey> [-privkey <private_key>]")
 			os.Exit(1)
 		}
 
-		err := listBlobs(*server, *pubkey)
+		err := listBlobs(*server, *pubkey, *privKey)
 		if err != nil {
 			debugLog("List blobs failed: %v", err)
 			fmt.Println("Error listing blobs:", err)
@@ -381,7 +382,6 @@ func uploadFile(server, filePath, privKey string, expiration time.Duration) erro
 	debugLog("Creating authorization event with expiration: %d (unix timestamp)", expirationUnix)
 	authEventJSON, err := createAuthorizationEvent(privKey, "upload", [][]string{
 		{"x", sha256Hash},
-		{"t", "upload"},
 		{"expiration", fmt.Sprintf("%d", expirationUnix)},
 	})
 	if err != nil {
@@ -486,14 +486,34 @@ func downloadFile(server, hash, outputPath string) error {
 	return nil
 }
 
-func listBlobs(server, pubkey string) error {
-	debugLog("Listing blobs: server=%s, pubkey=%s", server, pubkey)
+func listBlobs(server, pubkey, privKey string) error {
+	debugLog("Listing blobs: server=%s, pubkey=%s, privkey_provided=%v", server, pubkey, privKey != "")
 	listURL := fmt.Sprintf("%s/list/%s", server, pubkey)
 	debugLog("List URL: %s", listURL)
 
+	// Create request
+	req, err := http.NewRequest("GET", listURL, nil)
+	if err != nil {
+		debugLog("Failed to create HTTP request: %v", err)
+		return err
+	}
+
+	// Add authorization header if private key is provided
+	if privKey != "" {
+		debugLog("Private key provided, creating authorization event with verb 'list'")
+		authEventJSON, err := createAuthorizationEvent(privKey, "list", [][]string{})
+		if err != nil {
+			debugLog("Failed to create authorization event: %v", err)
+			return err
+		}
+		req.Header.Set("Authorization", "Nostr "+authEventJSON)
+		debugLog("Authorization header set (length: %d)", len(authEventJSON))
+	}
+
 	// Make request
 	debugLog("Sending GET request")
-	resp, err := http.Get(listURL)
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		debugLog("HTTP GET request failed: %v", err)
 		return err
@@ -647,7 +667,6 @@ func mirrorBlob(server, sourceServer, hash, privKey string, expiration time.Dura
 	debugLog("Creating authorization event with expiration: %d (unix timestamp)", expirationUnix)
 	authEventJSON, err := createAuthorizationEvent(privKey, "upload", [][]string{
 		{"x", hash},
-		{"t", "upload"},
 		{"expiration", fmt.Sprintf("%d", expirationUnix)},
 	})
 	if err != nil {
